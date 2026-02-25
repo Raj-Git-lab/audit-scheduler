@@ -88,9 +88,10 @@ def calculate_node_capacity(hr_metrics, log_callback=None):
             aht_minutes = float(row['AHT']) if pd.notna(row['AHT']) else 60
             shrinkage = float(row['Shrinkage']) if pd.notna(row['Shrinkage']) else 0
 
-            # Get optional columns with defaults
-            escalation = float(row['Escalation']) if 'Escalation' in row and pd.notna(row.get('Escalation')) else 1
-            new_launch = float(row['new_launch']) if 'new_launch' in row and pd.notna(row.get('new_launch')) else 1
+            escalation = float(row['Escalation']) if 'Escalation' in row and pd.notna(
+                row.get('Escalation')) else 1
+            new_launch = float(row['new_launch']) if 'new_launch' in row and pd.notna(
+                row.get('new_launch')) else 1
             image_review = float(row['image_review']) if 'image_review' in row and pd.notna(
                 row.get('image_review')) else 1
 
@@ -148,41 +149,43 @@ def get_required_gap(min_audits):
         return 52
 
 
+def circular_gap(w1, w2, total_weeks=52):
+    """
+    ✅ FIX #1: Proper circular distance between two weeks.
+    e.g., week 50 and week 3 are 5 apart (not 47).
+    """
+    diff = abs(w1 - w2)
+    return min(diff, total_weeks - diff)
+
+
 def prepare_data(classes_data, hr_metrics, log_callback=None):
     """Prepare and validate data"""
 
-    # Validate required columns
     required_columns = ['node', 'class_name', 'risk_score', 'percentile_group', 'minimum_audit_count']
     missing_columns = [col for col in required_columns if col not in classes_data.columns]
 
     if missing_columns:
         raise ValueError(f"Missing required columns in audit file: {missing_columns}")
 
-    # Create standardized column names
     classes_data = classes_data.copy()
     classes_data['batch_marketplace'] = classes_data['node']
     classes_data['class_key'] = classes_data['class_name']
 
-    # Ensure numeric columns
     classes_data['risk_score'] = pd.to_numeric(classes_data['risk_score'], errors='coerce').fillna(5.0)
     classes_data['minimum_audit_count'] = pd.to_numeric(
         classes_data['minimum_audit_count'], errors='coerce'
     ).fillna(1).astype(int)
     classes_data.loc[classes_data['minimum_audit_count'] < 0, 'minimum_audit_count'] = 1
 
-    # Calculate priority scores
     classes_data['priority_score'] = classes_data.apply(
         lambda row: get_priority_score(row, log_callback), axis=1
     )
 
-    # Handle duplicate class keys
     if classes_data['class_key'].duplicated().any():
         classes_data['class_key'] = classes_data['class_name'] + '_' + classes_data.index.astype(str)
 
-    # Calculate capacities
     yearly_capacity_dict, weekly_capacity_dict, capacity_df = calculate_node_capacity(hr_metrics, log_callback)
 
-    # Calculate demands
     total_demand = defaultdict(int)
     priority_demand = defaultdict(int)
     backlog_demand = defaultdict(int)
@@ -204,7 +207,7 @@ def prepare_data(classes_data, hr_metrics, log_callback=None):
 
 def distribute_audits(classes_data, yearly_capacity_dict, weekly_capacity_dict,
                       total_demand, priority_demand, backlog_demand, progress_callback=None):
-    """Distribute audits with gap-based scheduling"""
+    """Distribute audits with gap-based scheduling — FIXED VERSION"""
 
     weeks = list(range(1, 53))
     audit_schedule = pd.DataFrame(
@@ -216,47 +219,97 @@ def distribute_audits(classes_data, yearly_capacity_dict, weekly_capacity_dict,
     weekly_loads = defaultdict(lambda: defaultdict(int))
     scheduling_results = defaultdict(list)
 
+    # =====================================================
+    # ✅ FIX #2: Completely rewritten week-finding function
+    # =====================================================
     def find_weeks_with_gap(node, required_weeks, required_gap, weekly_capacity, start_week=1):
-        selected_weeks = []
-        within_capacity = True
+        """
+        Find weeks respecting gap and capacity.
+        Uses circular gap so wrap-around works correctly.
+        Tries multiple starting points if first attempt fails.
+        """
+        best_selected = []
+        best_within_capacity = False
 
-        current_week = start_week
-        attempts = 0
-        max_attempts = 200
+        # Try different starting weeks to maximize chances
+        start_weeks_to_try = list(range(1, 53))
 
-        while len(selected_weeks) < required_weeks and attempts < max_attempts:
-            attempts += 1
-
-            if current_week > 52:
-                current_week = 1
-
-            if weekly_loads[node][current_week] < weekly_capacity:
-                if not selected_weeks or all(abs(current_week - w) >= required_gap for w in selected_weeks):
-                    selected_weeks.append(current_week)
-                    current_week += required_gap
-                else:
-                    current_week += 1
-            else:
-                current_week += 1
-
-        if len(selected_weeks) < required_weeks:
-            within_capacity = False
+        for try_start in start_weeks_to_try:
             selected_weeks = []
+            current_week = try_start
 
-            if required_gap == 1:
-                selected_weeks = list(range(1, required_weeks + 1))
-            elif required_gap >= 52:
-                min_load_week = min(weeks, key=lambda w: weekly_loads[node][w])
-                selected_weeks = [min_load_week]
-            else:
-                current_week = 1
-                for i in range(required_weeks):
-                    selected_weeks.append(current_week)
-                    current_week += required_gap
-                    if current_week > 52:
-                        current_week = current_week - 52
+            for _ in range(required_weeks):
+                found = False
+                for offset in range(52):
+                    check_week = ((current_week + offset - 1) % 52) + 1
 
-        return sorted(selected_weeks), within_capacity
+                    # Check capacity
+                    if weekly_loads[node][check_week] < weekly_capacity:
+                        # ✅ FIX: Use circular_gap instead of abs()
+                        if not selected_weeks or all(
+                            circular_gap(check_week, w) >= required_gap
+                            for w in selected_weeks
+                        ):
+                            selected_weeks.append(check_week)
+                            current_week = ((check_week + required_gap - 1) % 52) + 1
+                            found = True
+                            break
+
+                if not found:
+                    break
+
+            if len(selected_weeks) == required_weeks:
+                return sorted(selected_weeks), True
+
+            # Keep track of best partial result
+            if len(selected_weeks) > len(best_selected):
+                best_selected = selected_weeks
+
+            # If we found at least something from first start, don't try all 52
+            if len(best_selected) >= required_weeks - 1 and try_start > 5:
+                break
+
+        # =====================================================
+        # ✅ FIX #3: Better fallback — try with relaxed gap
+        # =====================================================
+        # Try with progressively smaller gaps
+        for reduced_gap in range(max(1, required_gap - 1), 0, -1):
+            selected_weeks = []
+            current_week = 1
+
+            for _ in range(required_weeks):
+                found = False
+                for offset in range(52):
+                    check_week = ((current_week + offset - 1) % 52) + 1
+
+                    if weekly_loads[node][check_week] < weekly_capacity:
+                        if not selected_weeks or all(
+                            circular_gap(check_week, w) >= reduced_gap
+                            for w in selected_weeks
+                        ):
+                            selected_weeks.append(check_week)
+                            current_week = ((check_week + reduced_gap - 1) % 52) + 1
+                            found = True
+                            break
+
+                if not found:
+                    break
+
+            if len(selected_weeks) == required_weeks:
+                return sorted(selected_weeks), True
+
+        # =====================================================
+        # ✅ FIX #4: Final fallback — evenly spaced, ignore capacity
+        # =====================================================
+        selected_weeks = []
+        ideal_gap = max(1, 52 // required_weeks)
+        current_week = 1
+
+        for i in range(required_weeks):
+            week = ((current_week + i * ideal_gap - 1) % 52) + 1
+            selected_weeks.append(week)
+
+        return sorted(set(selected_weeks))[:required_weeks], False
 
     # Track statistics
     stats = {
@@ -354,7 +407,9 @@ def distribute_audits(classes_data, yearly_capacity_dict, weekly_capacity_dict,
             ascending=[False, False, False]
         )
 
-        # Phase 1: Schedule Priority Classes
+        # =====================================================
+        # Phase 1: Schedule Priority Classes (NON-ZFN)
+        # =====================================================
         for idx, row in priority_classes.iterrows():
             class_key = row['class_key']
             class_name = row['class_name']
@@ -367,6 +422,22 @@ def distribute_audits(classes_data, yearly_capacity_dict, weekly_capacity_dict,
             selected_weeks, within_capacity = find_weeks_with_gap(
                 node, min_audits, required_gap, weekly_capacity
             )
+
+            # ✅ FIX #5: Ensure we always have enough weeks
+            # If selected_weeks is shorter than min_audits, fill remaining
+            if len(selected_weeks) < min_audits:
+                existing = set(selected_weeks)
+                # Add least-loaded weeks that aren't already selected
+                remaining_weeks = sorted(
+                    [w for w in weeks if w not in existing],
+                    key=lambda w: weekly_loads[node][w]
+                )
+                for w in remaining_weeks:
+                    if len(selected_weeks) >= min_audits:
+                        break
+                    selected_weeks.append(w)
+                selected_weeks = sorted(selected_weeks)
+                within_capacity = False
 
             if within_capacity and len(selected_weeks) == min_audits:
                 for week in selected_weeks:
@@ -401,14 +472,16 @@ def distribute_audits(classes_data, yearly_capacity_dict, weekly_capacity_dict,
                 })
                 stats['over_capacity'] += 1
 
-        # Phase 2: Fill with ZFN Classes
+        # =====================================================
+        # Phase 2: Fill with ZFN Classes — FIXED
+        # =====================================================
         remaining_capacity = {}
         for week in weeks:
             remaining_capacity[week] = weekly_capacity - weekly_loads[node][week]
 
         total_remaining = sum(max(0, cap) for cap in remaining_capacity.values())
 
-        if total_remaining > 0 and len(zfn_classes) > 0:
+        if len(zfn_classes) > 0:
             zfn_classes = zfn_classes.sort_values(
                 ['risk_score', 'minimum_audit_count'],
                 ascending=[False, False]
@@ -423,38 +496,51 @@ def distribute_audits(classes_data, yearly_capacity_dict, weekly_capacity_dict,
 
                 required_gap = get_required_gap(min_audits)
 
+                # =====================================================
+                # ✅ FIX #6: Multi-pass ZFN scheduling with gap relaxation
+                # =====================================================
                 selected_weeks = []
-                current_week = 1
+                scheduled = False
 
-                for attempt in range(min_audits):
-                    found = False
-                    for offset in range(52):
-                        check_week = ((current_week + offset - 1) % 52) + 1
+                # Pass 1: Try with full gap and remaining capacity
+                for try_gap in range(required_gap, 0, -1):
+                    selected_weeks = []
+                    current_week = 1
 
-                        if remaining_capacity[check_week] > 0:
-                            if not selected_weeks or all(
-                                    abs(check_week - w) >= required_gap or
-                                    abs(check_week - w) >= (52 - required_gap)
-                                    for w in selected_weeks):
-                                selected_weeks.append(check_week)
-                                remaining_capacity[check_week] -= 1
-                                current_week = check_week + required_gap
-                                found = True
-                                break
+                    for attempt in range(min_audits):
+                        found = False
+                        for offset in range(52):
+                            check_week = ((current_week + offset - 1) % 52) + 1
 
-                    if not found:
+                            if remaining_capacity.get(check_week, 0) > 0:
+                                # ✅ FIX: Use circular_gap
+                                if not selected_weeks or all(
+                                    circular_gap(check_week, w) >= try_gap
+                                    for w in selected_weeks
+                                ):
+                                    selected_weeks.append(check_week)
+                                    current_week = ((check_week + try_gap - 1) % 52) + 1
+                                    found = True
+                                    break
+
+                        if not found:
+                            break
+
+                    if len(selected_weeks) == min_audits:
+                        scheduled = True
                         break
 
-                if len(selected_weeks) == min_audits:
+                if scheduled:
                     for week in selected_weeks:
                         audit_schedule.loc[class_key, week] = 1
                         weekly_loads[node][week] += 1
+                        remaining_capacity[week] -= 1
 
                     scheduling_results[node].append({
                         'class_key': class_key,
                         'class_name': class_name,
                         'status': 'ZFN',
-                        'scheduled_weeks': selected_weeks,
+                        'scheduled_weeks': sorted(selected_weeks),
                         'min_audits': min_audits,
                         'required_gap': required_gap,
                         'priority_score': priority_score,
@@ -462,30 +548,64 @@ def distribute_audits(classes_data, yearly_capacity_dict, weekly_capacity_dict,
                     })
                     stats['zfn_scheduled'] += 1
                 else:
-                    scheduling_results[node].append({
-                        'class_key': class_key,
-                        'class_name': class_name,
-                        'status': 'ZFN - Not Scheduled',
-                        'scheduled_weeks': [],
-                        'min_audits': min_audits,
-                        'required_gap': required_gap,
-                        'priority_score': priority_score,
-                        'risk_score': risk_score
-                    })
-                    stats['zfn_not_scheduled'] += 1
-        elif len(zfn_classes) > 0:
-            for idx, row in zfn_classes.iterrows():
-                scheduling_results[node].append({
-                    'class_key': row['class_key'],
-                    'class_name': row['class_name'],
-                    'status': 'ZFN - Not Scheduled',
-                    'scheduled_weeks': [],
-                    'min_audits': int(row['minimum_audit_count']),
-                    'required_gap': get_required_gap(int(row['minimum_audit_count'])),
-                    'priority_score': row['priority_score'],
-                    'risk_score': row['risk_score']
-                })
-                stats['zfn_not_scheduled'] += 1
+                    # ✅ FIX #7: Even ZFN gets a fallback — schedule in least-loaded weeks
+                    selected_weeks = []
+                    available_weeks = sorted(
+                        weeks,
+                        key=lambda w: remaining_capacity.get(w, 0),
+                        reverse=True
+                    )
+
+                    for w in available_weeks:
+                        if len(selected_weeks) >= min_audits:
+                            break
+                        if remaining_capacity.get(w, 0) > 0:
+                            if not selected_weeks or all(
+                                circular_gap(w, sw) >= max(1, required_gap // 2)
+                                for sw in selected_weeks
+                            ):
+                                selected_weeks.append(w)
+
+                    # If still not enough, add any available weeks
+                    if len(selected_weeks) < min_audits:
+                        for w in available_weeks:
+                            if len(selected_weeks) >= min_audits:
+                                break
+                            if w not in selected_weeks and remaining_capacity.get(w, 0) > 0:
+                                selected_weeks.append(w)
+
+                    if len(selected_weeks) > 0:
+                        for week in selected_weeks:
+                            audit_schedule.loc[class_key, week] = 1
+                            weekly_loads[node][week] += 1
+                            remaining_capacity[week] -= 1
+
+                        scheduling_results[node].append({
+                            'class_key': class_key,
+                            'class_name': class_name,
+                            'status': 'ZFN - Partial' if len(selected_weeks) < min_audits else 'ZFN',
+                            'scheduled_weeks': sorted(selected_weeks),
+                            'min_audits': min_audits,
+                            'required_gap': required_gap,
+                            'priority_score': priority_score,
+                            'risk_score': risk_score
+                        })
+                        if len(selected_weeks) == min_audits:
+                            stats['zfn_scheduled'] += 1
+                        else:
+                            stats['zfn_not_scheduled'] += 1
+                    else:
+                        scheduling_results[node].append({
+                            'class_key': class_key,
+                            'class_name': class_name,
+                            'status': 'ZFN - Not Scheduled',
+                            'scheduled_weeks': [],
+                            'min_audits': min_audits,
+                            'required_gap': required_gap,
+                            'priority_score': priority_score,
+                            'risk_score': risk_score
+                        })
+                        stats['zfn_not_scheduled'] += 1
 
     return audit_schedule, scheduling_results, weekly_loads, stats
 
@@ -498,7 +618,6 @@ def create_excel_output(audit_schedule, scheduling_results,
 
     output = BytesIO()
 
-    # Create lookup dictionaries
     class_lookup = {}
     for _, row in classes_data.iterrows():
         class_key = row['class_key']
@@ -548,7 +667,7 @@ def create_excel_output(audit_schedule, scheduling_results,
 
         within_capacity = sum(1 for r in node_results if r['status'] == 'Within Capacity')
         over_capacity = sum(1 for r in node_results if r['status'] == 'Over Capacity')
-        zfn_count = sum(1 for r in node_results if r['status'] == 'ZFN')
+        zfn_count = sum(1 for r in node_results if r['status'] in ['ZFN', 'ZFN - Partial'])
 
         loads = list(weekly_loads[node].values())
         max_load = max(loads) if loads else 0
@@ -641,11 +760,9 @@ def create_excel_output(audit_schedule, scheduling_results,
 
     demand_capacity_df = pd.DataFrame(demand_capacity_data)
 
-    # Write to Excel with formatting
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         workbook = writer.book
 
-        # Define formats
         header_format = workbook.add_format({
             'bold': True,
             'bg_color': '#4472C4',
@@ -676,7 +793,6 @@ def create_excel_output(audit_schedule, scheduling_results,
             'align': 'center'
         })
 
-        # Write sheets
         schedule_output.to_excel(writer, sheet_name='Audit Schedule', index=False)
         worksheet = writer.sheets['Audit Schedule']
         for col_num, value in enumerate(schedule_output.columns.values):
@@ -685,7 +801,6 @@ def create_excel_output(audit_schedule, scheduling_results,
         worksheet.set_column('B:H', 15)
         worksheet.freeze_panes(1, 8)
 
-        # Format week columns
         status_col = 7
         first_week_col = 8
         for row_idx in range(len(schedule_output)):
@@ -695,7 +810,7 @@ def create_excel_output(audit_schedule, scheduling_results,
                 worksheet.write(excel_row, status_col, status, within_capacity_format)
             elif status == 'Over Capacity':
                 worksheet.write(excel_row, status_col, status, over_capacity_format)
-            elif status == 'ZFN':
+            elif 'ZFN' in status:
                 worksheet.write(excel_row, status_col, status, zfn_format)
 
             for week_offset in range(52):
